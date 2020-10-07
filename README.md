@@ -1,3 +1,8 @@
+
+This repository modified the original code to provide a flexible API and makes it much easier to handle complicated input of a model.
+
+Bellow is the original README file.
+
 # PyTorch learning rate finder
 
 ![](https://github.com/davidtvs/pytorch-lr-finder/workflows/ci-build/badge.svg?branch=master)

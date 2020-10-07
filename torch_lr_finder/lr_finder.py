@@ -11,97 +11,42 @@ from packaging import version
 
 PYTORCH_VERSION = version.parse(torch.__version__)
 
-try:
-    from apex import amp
 
-    IS_AMP_AVAILABLE = True
-except ImportError:
-    IS_AMP_AVAILABLE = False
+class Step:
 
+    def _move_to_device(self, *things, device, non_blocking=True):
+        def move(obj, device, non_blocking=True):
+            if hasattr(obj, "to"):
+                return obj.to(device, non_blocking=non_blocking)
+            elif isinstance(obj, tuple):
+                return tuple(move(o, device, non_blocking) for o in obj)
+            elif isinstance(obj, list):
+                return [move(o, device, non_blocking) for o in obj]
+            elif isinstance(obj, dict):
+                return {k: move(o, device, non_blocking) for k, o in obj.items()}
+            else:
+                return obj
+        return (move(i,device=device,non_blocking=non_blocking) for i in things)
 
-class DataLoaderIter(object):
-    def __init__(self, data_loader):
-        self.data_loader = data_loader
-        self._iterator = iter(data_loader)
+    def _step(self):
+        """
+        run your model on one batch
+        :return:
+        """
+        raise NotImplementedError('_step() is not implemented')
 
-    @property
-    def dataset(self):
-        return self.data_loader.dataset
+    def _reset(self):
+        """
+        reset batch iterator
+        """
+        raise NotImplementedError('_reset() is not implemented')
 
-    def inputs_labels_from_batch(self, batch_data):
-        if not isinstance(batch_data, list) and not isinstance(batch_data, tuple):
-            raise ValueError(
-                "Your batch type is not supported: {}. Please inherit from "
-                "`TrainDataLoaderIter` or `ValDataLoaderIter` and override the "
-                "`inputs_labels_from_batch` method.".format(type(batch_data))
-            )
-
-        inputs, labels, *_ = batch_data
-
-        return inputs, labels
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        batch = next(self._iterator)
-        return self.inputs_labels_from_batch(batch)
-
-
-class TrainDataLoaderIter(DataLoaderIter):
-    def __init__(self, data_loader, auto_reset=True):
-        super().__init__(data_loader)
-        self.auto_reset = auto_reset
-
-    def __next__(self):
+    def step(self):
         try:
-            batch = next(self._iterator)
-            inputs, labels = self.inputs_labels_from_batch(batch)
+            return self._step()
         except StopIteration:
-            if not self.auto_reset:
-                raise
-            self._iterator = iter(self.data_loader)
-            batch = next(self._iterator)
-            inputs, labels = self.inputs_labels_from_batch(batch)
-
-        return inputs, labels
-
-
-class ValDataLoaderIter(DataLoaderIter):
-    """This iterator will reset itself **only** when it is acquired by
-    the syntax of normal `iterator`. That is, this iterator just works
-    like a `torch.data.DataLoader`. If you want to restart it, you
-    should use it like:
-
-        ```
-        loader_iter = ValDataLoaderIter(data_loader)
-        for batch in loader_iter:
-            ...
-
-        # `loader_iter` should run out of values now, you can restart it by:
-        # 1. the way we use a `torch.data.DataLoader`
-        for batch in loader_iter:        # __iter__ is called implicitly
-            ...
-
-        # 2. passing it into `iter()` manually
-        loader_iter = iter(loader_iter)  # __iter__ is called by `iter()`
-        ```
-    """
-
-    def __init__(self, data_loader):
-        super().__init__(data_loader)
-        self.run_limit = len(self.data_loader)
-        self.run_counter = 0
-
-    def __iter__(self):
-        if self.run_counter >= self.run_limit:
-            self._iterator = iter(self.data_loader)
-            self.run_counter = 0
-        return self
-
-    def __next__(self):
-        self.run_counter += 1
-        return super(ValDataLoaderIter, self).__next__()
+            self._reset()
+            return self._step()
 
 
 class LRFinder(object):
@@ -113,26 +58,19 @@ class LRFinder(object):
     and what is the optimal learning rate.
 
     Arguments:
-        model (torch.nn.Module): wrapped model.
         optimizer (torch.optim.Optimizer): wrapped optimizer where the defined learning
             is assumed to be the lower boundary of the range test.
-        criterion (torch.nn.Module): wrapped loss function.
         device (str or torch.device, optional): a string ("cpu" or "cuda") with an
             optional ordinal for the device type (e.g. "cuda:X", where is the ordinal).
             Alternatively, can be an object representing the device on which the
-            computation will take place. Default: None, uses the same device as `model`.
-        memory_cache (boolean, optional): if this flag is set to True, `state_dict` of
-            model and optimizer will be cached in memory. Otherwise, they will be saved
-            to files under the `cache_dir`.
-        cache_dir (string, optional): path for storing temporary files. If no path is
-            specified, system-wide temporary directory is used. Notice that this
-            parameter will be ignored if `memory_cache` is True.
+            computation will take place.
+        train_step (Step): User's Implemtation of Step. It will be called as `loss = train_step.step()`.
+        val_step (Step): User's Implemtation of Step. It will be called as `loss = val_step.step()`. default: None
 
     Example:
-        >>> lr_finder = LRFinder(net, optimizer, criterion, device="cuda")
+        >>> lr_finder = LRFinder(optimizer, device="cuda", train_step)
         >>> lr_finder.range_test(dataloader, end_lr=100, num_iter=100)
         >>> lr_finder.plot() # to inspect the loss-learning rate graph
-        >>> lr_finder.reset() # to reset the model and optimizer to their initial state
 
     Reference:
     Cyclical Learning Rates for Training Neural Networks: https://arxiv.org/abs/1506.01186
@@ -141,48 +79,25 @@ class LRFinder(object):
 
     def __init__(
         self,
-        model,
         optimizer,
-        criterion,
-        device=None,
-        memory_cache=True,
-        cache_dir=None,
+        device,
+        train_step:Step,
+        val_step:Step = None,
     ):
+
+        self.train_step = train_step
+        self.val_step = val_step
+
         # Check if the optimizer is already attached to a scheduler
         self.optimizer = optimizer
         self._check_for_scheduler()
 
-        self.model = model
-        self.criterion = criterion
         self.history = {"lr": [], "loss": []}
         self.best_loss = None
-        self.memory_cache = memory_cache
-        self.cache_dir = cache_dir
-
-        # Save the original state of the model and optimizer so they can be restored if
-        # needed
-        self.model_device = next(self.model.parameters()).device
-        self.state_cacher = StateCacher(memory_cache, cache_dir=cache_dir)
-        self.state_cacher.store("model", self.model.state_dict())
-        self.state_cacher.store("optimizer", self.optimizer.state_dict())
-
-        # If device is None, use the same as the model
-        if device:
-            self.device = device
-        else:
-            self.device = self.model_device
-
-    def reset(self):
-        """Restores the model and optimizer to their initial states."""
-
-        self.model.load_state_dict(self.state_cacher.retrieve("model"))
-        self.optimizer.load_state_dict(self.state_cacher.retrieve("optimizer"))
-        self.model.to(self.model_device)
+        self.device = device
 
     def range_test(
         self,
-        train_loader,
-        val_loader=None,
         start_lr=None,
         end_lr=10,
         num_iter=100,
@@ -267,9 +182,6 @@ class LRFinder(object):
         self.history = {"lr": [], "loss": []}
         self.best_loss = None
 
-        # Move the model to the proper device
-        self.model.to(self.device)
-
         # Check if the optimizer is already attached to a scheduler
         self._check_for_scheduler()
 
@@ -288,41 +200,11 @@ class LRFinder(object):
         if smooth_f < 0 or smooth_f >= 1:
             raise ValueError("smooth_f is outside the range [0, 1[")
 
-        # Create an iterator to get data batch by batch
-        if isinstance(train_loader, DataLoader):
-            train_iter = TrainDataLoaderIter(train_loader)
-        elif isinstance(train_loader, TrainDataLoaderIter):
-            train_iter = train_loader
-        else:
-            raise ValueError(
-                "`train_loader` has unsupported type: {}."
-                "Expected types are `torch.utils.data.DataLoader`"
-                "or child of `TrainDataLoaderIter`.".format(type(train_loader))
-            )
-
-        if val_loader:
-            if isinstance(val_loader, DataLoader):
-                val_iter = ValDataLoaderIter(val_loader)
-            elif isinstance(val_loader, ValDataLoaderIter):
-                val_iter = val_loader
-            else:
-                raise ValueError(
-                    "`val_loader` has unsupported type: {}."
-                    "Expected types are `torch.utils.data.DataLoader`"
-                    "or child of `ValDataLoaderIter`.".format(type(val_loader))
-                )
-
         for iteration in tqdm(range(num_iter)):
             # Train on batch and retrieve loss
-            loss = self._train_batch(
-                train_iter,
-                accumulation_steps,
-                non_blocking_transfer=non_blocking_transfer,
-            )
-            if val_loader:
-                loss = self._validate(
-                    val_iter, non_blocking_transfer=non_blocking_transfer
-                )
+            loss = self.train_step.step()
+            if self.val_step is not None:
+                loss = self.val_step.step()
 
             # Update the learning rate
             self.history["lr"].append(lr_schedule.get_lr()[0])
@@ -361,81 +243,6 @@ class LRFinder(object):
         for param_group in self.optimizer.param_groups:
             if "initial_lr" in param_group:
                 raise RuntimeError("Optimizer already has a scheduler attached to it")
-
-    def _train_batch(self, train_iter, accumulation_steps, non_blocking_transfer=True):
-        self.model.train()
-        total_loss = None  # for late initialization
-
-        self.optimizer.zero_grad()
-        for i in range(accumulation_steps):
-            inputs, labels = next(train_iter)
-            inputs, labels = self._move_to_device(
-                inputs, labels, non_blocking=non_blocking_transfer
-            )
-
-            # Forward pass
-            outputs = self.model(inputs)
-            loss = self.criterion(outputs, labels)
-
-            # Loss should be averaged in each step
-            loss /= accumulation_steps
-
-            # Backward pass
-            if IS_AMP_AVAILABLE and hasattr(self.optimizer, "_amp_stash"):
-                # For minor performance optimization, see also:
-                # https://nvidia.github.io/apex/advanced.html#gradient-accumulation-across-iterations
-                delay_unscale = ((i + 1) % accumulation_steps) != 0
-
-                with amp.scale_loss(
-                    loss, self.optimizer, delay_unscale=delay_unscale
-                ) as scaled_loss:
-                    scaled_loss.backward()
-            else:
-                loss.backward()
-
-            if total_loss is None:
-                total_loss = loss
-            else:
-                total_loss += loss
-
-        self.optimizer.step()
-
-        return total_loss.item()
-
-    def _move_to_device(self, inputs, labels, non_blocking=True):
-        def move(obj, device, non_blocking=True):
-            if hasattr(obj, "to"):
-                return obj.to(device, non_blocking=non_blocking)
-            elif isinstance(obj, tuple):
-                return tuple(move(o, device, non_blocking) for o in obj)
-            elif isinstance(obj, list):
-                return [move(o, device, non_blocking) for o in obj]
-            elif isinstance(obj, dict):
-                return {k: move(o, device, non_blocking) for k, o in obj.items()}
-            else:
-                return obj
-
-        inputs = move(inputs, self.device, non_blocking=non_blocking)
-        labels = move(labels, self.device, non_blocking=non_blocking)
-        return inputs, labels
-
-    def _validate(self, val_iter, non_blocking_transfer=True):
-        # Set model to evaluation mode and disable gradient computation
-        running_loss = 0
-        self.model.eval()
-        with torch.no_grad():
-            for inputs, labels in val_iter:
-                # Move data to the correct device
-                inputs, labels = self._move_to_device(
-                    inputs, labels, non_blocking=non_blocking_transfer
-                )
-
-                # Forward pass and loss computation
-                outputs = self.model(inputs)
-                loss = self.criterion(outputs, labels)
-                running_loss += loss.item() * len(labels)
-
-        return running_loss / len(val_iter.dataset)
 
     def plot(
         self,
@@ -602,53 +409,3 @@ class ExponentialLR(_LRScheduler):
             r = self.last_epoch / (self.num_iter - 1)
 
         return [base_lr * (self.end_lr / base_lr) ** r for base_lr in self.base_lrs]
-
-
-class StateCacher(object):
-    def __init__(self, in_memory, cache_dir=None):
-        self.in_memory = in_memory
-        self.cache_dir = cache_dir
-
-        if self.cache_dir is None:
-            import tempfile
-
-            self.cache_dir = tempfile.gettempdir()
-        else:
-            if not os.path.isdir(self.cache_dir):
-                raise ValueError("Given `cache_dir` is not a valid directory.")
-
-        self.cached = {}
-
-    def store(self, key, state_dict):
-        if self.in_memory:
-            self.cached.update({key: copy.deepcopy(state_dict)})
-        else:
-            fn = os.path.join(self.cache_dir, "state_{}_{}.pt".format(key, id(self)))
-            self.cached.update({key: fn})
-            torch.save(state_dict, fn)
-
-    def retrieve(self, key):
-        if key not in self.cached:
-            raise KeyError("Target {} was not cached.".format(key))
-
-        if self.in_memory:
-            return self.cached.get(key)
-        else:
-            fn = self.cached.get(key)
-            if not os.path.exists(fn):
-                raise RuntimeError(
-                    "Failed to load state in {}. File doesn't exist anymore.".format(fn)
-                )
-            state_dict = torch.load(fn, map_location=lambda storage, location: storage)
-            return state_dict
-
-    def __del__(self):
-        """Check whether there are unused cached files existing in `cache_dir` before
-        this instance being destroyed."""
-
-        if self.in_memory:
-            return
-
-        for k in self.cached:
-            if os.path.exists(self.cached[k]):
-                os.remove(self.cached[k])
